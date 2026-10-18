@@ -1,0 +1,42 @@
+# Môi trường ảo (Virtual Environments)
+venv/
+env/
+.venv/
+.env
+
+# Cache của Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database & Runtime Data
+*.db
+*.sqlite3
+database.db
+data/
+*.log
+*.pid
+
+# File IDE / Hệ điều hành
+.vscode/
+.idea/
+.DS_Store
+.aider*
+
+# Tài liệu nội bộ & Cấu hình AI nội bộ (Internal only)
+# .agents/
+# ARCHITECTURE.md
+# E2E_TESTING.md
+# llms.txt
+# .github/
+# tests/
+# pytest.ini
+# requirements-dev.txt
+
+# Tài nguyên thiết kế & công cụ chỉ dành cho lập trình viên (Dev-only emoji assets & generators)
+assets/emojis/
+scripts/generate_emojis.py
+scripts/generate_all_emojis_v2.py
+scripts/generate_preview_grid.py
+scratch/
+.freebuff/

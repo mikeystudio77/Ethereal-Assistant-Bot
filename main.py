@@ -1,0 +1,473 @@
+"""
+main.py — Điểm vào duy nhất quản lý toàn bộ hệ thống Zeryn (Ethereal Assistant V2).
+Hỗ trợ các lệnh:
+  python main.py              (Khởi chạy toàn bộ: Bot Discord, Dashboard, Watchdog)
+  python main.py --start      (Khởi chạy toàn bộ hệ thống)
+  python main.py --stop       (Dừng Bot & Dashboard, giữ Watchdog để tự động bật lại sau 30s)
+  python main.py --stopall    (Dừng sạch tất cả services kể cả Watchdog và gửi webhook)
+  python main.py --restart    (Tắt sạch và khởi động lại)
+  python main.py --status     (Kiểm tra trạng thái các services)
+  python main.py --test       (Chạy Self-Diagnostic Tester)
+  python main.py --bot        (Chỉ chạy Bot Discord)
+  python main.py --dashboard  (Chỉ chạy Web Dashboard)
+  python main.py --sync       (Chạy Bot & đồng bộ lại Slash Commands với Discord)
+"""
+
+import sys
+import os
+import json
+import time
+import shutil
+import subprocess
+import signal
+import asyncio
+from typing import Optional
+
+# Force UTF-8 output on all platforms (prevents UnicodeEncodeError on Windows cp1252)
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:
+    pass  # Python <3.7 fallback
+
+# Setup sys.path
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
+sys.path.insert(0, os.path.join(BASE_DIR, "bot"))
+
+import config
+from database import init_db
+
+PID_DIR = os.path.join(BASE_DIR, "data")
+PID_BOT = os.path.join(PID_DIR, "bot.pid")
+PID_DASH = os.path.join(PID_DIR, "dashboard.pid")
+PID_WATCHDOG = os.path.join(PID_DIR, "watchdog.pid")
+FLAG_STOPALL = os.path.join(PID_DIR, "stopall.flag")
+
+
+def _read_pid(file_path: str) -> Optional[int]:
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r") as f:
+                return int(f.read().strip())
+        except Exception:
+            pass
+    return None
+
+
+def _write_pid(file_path: str, pid: int):
+    os.makedirs(PID_DIR, exist_ok=True)
+    with open(file_path, "w") as f:
+        f.write(str(pid))
+
+
+def _remove_pid(file_path: str):
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+
+
+def _is_pid_running(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        if os.name == "nt":
+            output = subprocess.check_output(["tasklist", "/FI", f"PID eq {pid}"], text=True)
+            return str(pid) in output
+        else:
+            os.kill(pid, 0)
+            return True
+    except Exception:
+        return False
+
+
+def _enforce_file_security():
+    """Tự động thiết lập quyền bảo mật tệp (chmod 600 / 700) trên Linux/Termux."""
+    if os.name == "nt":
+        return
+    
+    # 1. Đặt quyền thư mục data/ thành 700 (chỉ user Termux truy cập)
+    if os.path.exists(PID_DIR):
+        try:
+            os.chmod(PID_DIR, 0o700)
+        except OSError:
+            pass
+
+    # 2. Đặt quyền tệp nhạy cảm (.env, database, logs) thành 600 (chỉ user đọc/ghi)
+    sensitive_files = [
+        os.path.join(BASE_DIR, ".env"),
+        os.path.join(PID_DIR, "bot.db"),
+        os.path.join(PID_DIR, "bot.db-wal"),
+        os.path.join(PID_DIR, "bot.db-shm"),
+        os.path.join(PID_DIR, "bot.log"),
+        os.path.join(PID_DIR, "dashboard.log"),
+    ]
+    for filepath in sensitive_files:
+        if os.path.exists(filepath):
+            try:
+                os.chmod(filepath, 0o600)
+            except OSError:
+                pass
+
+
+def _kill_gracefully(pid: int, name: str, timeout: float = 1.5) -> bool:
+    """Tắt tiến trình an toàn: gửi SIGTERM trước, chờ tiến trình thoát, nếu không thoát mới SIGKILL."""
+    if not pid or pid == os.getpid():
+        return False
+    if not _is_pid_running(pid):
+        return True
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+            return True
+        else:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return True
+            except PermissionError as e:
+                print(f" - Permission denied stopping {name} (PID {pid}): {e}")
+                return False
+
+            t0 = time.time()
+            while time.time() - t0 < timeout:
+                if not _is_pid_running(pid):
+                    print(f" - Stopped {name} (PID {pid})")
+                    return True
+                time.sleep(0.25)
+
+            if _is_pid_running(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    time.sleep(0.25)
+                    print(f" - Force stopped {name} (PID {pid})")
+                except ProcessLookupError:
+                    pass
+                except PermissionError as e:
+                    print(f" - Permission denied force stopping {name} (PID {pid}): {e}")
+                    return False
+            return not _is_pid_running(pid)
+    except Exception as e:
+        print(f" - Error stopping {name} (PID {pid}): {e}")
+        return False
+
+
+def stop_services(keep_watchdog: bool = False):
+    """
+    Dừng các dịch vụ trong hệ thống:
+    - keep_watchdog=True  (--stop): Chỉ dừng Bot và Dashboard. Giữ Watchdog để tự động bật lại sau 30s.
+    - keep_watchdog=False (--stopall): Dừng sạch toàn bộ kể cả Watchdog, giải phóng wake-lock.
+    """
+    if keep_watchdog:
+        print("[Main] Stopping Bot and Dashboard (keeping Watchdog active for auto-recovery)...")
+        if os.path.exists(FLAG_STOPALL):
+            try:
+                os.remove(FLAG_STOPALL)
+            except Exception:
+                pass
+    else:
+        print("[Main] Stopping all system services (including Watchdog)...")
+        # Ghi cờ stopall để Watchdog nhận biết và ngắt ngay lập tức
+        try:
+            with open(FLAG_STOPALL, "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+
+        # Gửi webhook thông báo trước khi dừng toàn bộ dịch vụ
+        script_status = os.path.join(BASE_DIR, "scripts", "send_status.py")
+        if os.path.exists(script_status):
+            try:
+                subprocess.run([sys.executable, script_status, "stop"], timeout=5)
+            except Exception:
+                pass
+
+    # 1. Dừng Watchdog trước nếu được yêu cầu (--stopall) để tránh race condition tự động restart
+    if not keep_watchdog:
+        try:
+            wd_pid = _read_pid(PID_WATCHDOG)
+            if wd_pid and _is_pid_running(wd_pid):
+                _kill_gracefully(wd_pid, "Watchdog", timeout=1.0)
+                if not _is_pid_running(wd_pid):
+                    _remove_pid(PID_WATCHDOG)
+        except Exception as e:
+            print(f" - Warning khi dừng Watchdog: {e}")
+
+        if os.name != "nt":
+            # Dọn sạch các tiến trình watchdog cũ còn sót lại để tránh orphan
+            my_pid = os.getpid()
+            try:
+                out = subprocess.check_output(["pgrep", "-f", "watchdog.sh"], text=True).strip()
+                for p in out.splitlines():
+                    p_str = p.strip()
+                    if p_str.isdigit() and int(p_str) != my_pid:
+                        try:
+                            os.kill(int(p_str), signal.SIGTERM)
+                            time.sleep(0.2)
+                            if _is_pid_running(int(p_str)):
+                                os.kill(int(p_str), signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+            except Exception:
+                pass
+
+            subprocess.run("termux-wake-unlock 2>/dev/null", shell=True)
+
+    # 2. Dừng Bot Discord bằng PID thực tế
+    try:
+        bot_pid = get_live_bot_pid()
+        if bot_pid:
+            _kill_gracefully(bot_pid, "Bot", timeout=1.0)
+            if not _is_pid_running(bot_pid):
+                _remove_pid(PID_BOT)
+    except Exception as e:
+        print(f" - Warning khi dừng Bot: {e}")
+
+    # 3. Dừng Dashboard bằng PID thực tế
+    try:
+        dash_pid = get_live_dash_pid()
+        if dash_pid:
+            _kill_gracefully(dash_pid, "Dashboard", timeout=1.0)
+            if not _is_pid_running(dash_pid):
+                _remove_pid(PID_DASH)
+    except Exception as e:
+        print(f" - Warning khi dừng Dashboard: {e}")
+
+    if keep_watchdog:
+        print("[Main] Bot & Dashboard stopped. Watchdog is running and will auto-restart them after 30s.")
+    else:
+        print("[Main] All services (including Watchdog) stopped successfully.")
+
+
+def stop_all():
+    """Dừng toàn bộ hệ thống (kể cả Watchdog)."""
+    stop_services(keep_watchdog=False)
+
+
+def get_live_bot_pid() -> Optional[int]:
+    """Tìm PID chính xác của Bot đang chạy (kể cả khi Watchdog vừa restart)."""
+    # 1. Kiểm tra file bot.pid
+    pid = _read_pid(PID_BOT)
+    if pid and _is_pid_running(pid):
+        return pid
+
+    # 2. Kiểm tra file data/health.json do Bot ghi
+    health_file = os.path.join(PID_DIR, "health.json")
+    if os.path.exists(health_file):
+        try:
+            with open(health_file, "r", encoding="utf-8") as f:
+                h = json.load(f)
+                h_pid = h.get("pid")
+                if h_pid and _is_pid_running(h_pid):
+                    _write_pid(PID_BOT, h_pid)
+                    return h_pid
+        except Exception:
+            pass
+    if os.name != "nt":
+        try:
+            out = subprocess.check_output("pgrep -f 'main.py.*--bot' 2>/dev/null", shell=True, text=True).strip()
+            if out:
+                pids = [int(p) for p in out.splitlines() if int(p) != os.getpid()]
+                if pids:
+                    return pids[0]
+        except Exception:
+            pass
+    return None
+
+
+def get_live_dash_pid() -> Optional[int]:
+    pid = _read_pid(PID_DASH)
+    if pid and _is_pid_running(pid):
+        return pid
+    if os.name != "nt":
+        try:
+            out = subprocess.check_output("pgrep -f 'main.py.*--dashboard' 2>/dev/null", shell=True, text=True).strip()
+            if out:
+                pids = [int(p) for p in out.splitlines() if int(p) != os.getpid()]
+                if pids:
+                    return pids[0]
+        except Exception:
+            pass
+    return None
+
+
+def print_status():
+    print("[Status] Ethereal Assistant V2 System Status:")
+    
+    bot_pid = get_live_bot_pid()
+    dash_pid = get_live_dash_pid()
+
+    bot_status   = f"RUNNING (PID {bot_pid})" if bot_pid else "STOPPED"
+    dash_status  = f"RUNNING (PID {dash_pid})" if dash_pid else "STOPPED"
+    print(f"  RAM Cache: IN-MEMORY (Pure Python)")
+    print(f"  Bot:       {bot_status}")
+    print(f"  Dashboard: {dash_status}")
+
+
+def run_only_bot():
+    _enforce_file_security()
+    print("[Bot] Starting Bot Discord v2...")
+    _write_pid(PID_BOT, os.getpid())
+    try:
+        from bot.bot import main as bot_main
+    except ModuleNotFoundError:
+        from bot import main as bot_main
+    try:
+        asyncio.run(bot_main())
+    finally:
+        _remove_pid(PID_BOT)
+
+
+def run_only_dashboard():
+    _enforce_file_security()
+    dash_host = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
+    dash_port = int(os.environ.get("DASHBOARD_PORT", "5000"))
+    print(f"[Dashboard] Starting at http://{dash_host}:{dash_port}...")
+    _write_pid(PID_DASH, os.getpid())
+    init_db()
+    try:
+        from dashboard.app import app
+        # Ưu tiên Waitress (production-grade WSGI, đa luồng, chạy được
+        # Windows/Linux/Termux). Fallback về Flask dev server nếu chưa cài.
+        try:
+            from waitress import serve
+            print("[Dashboard] Serving with Waitress WSGI (4 threads)...")
+            serve(app, host=dash_host, port=dash_port, threads=4)
+        except ImportError:
+            print("[Dashboard] WARNING: 'waitress' chưa cài — chạy Flask dev server "
+                  "(không khuyến nghị cho production). pip install waitress")
+            app.run(host=dash_host, port=dash_port, debug=False)
+    finally:
+        _remove_pid(PID_DASH)
+
+
+def start_all():
+    print("[Main] Starting full system Ethereal Assistant V2...")
+    _enforce_file_security()
+
+    # Xóa cờ stopall nếu còn sót lại từ lần dừng trước
+    if os.path.exists(FLAG_STOPALL):
+        try:
+            os.remove(FLAG_STOPALL)
+        except Exception:
+            pass
+
+    if os.name != "nt":
+        subprocess.run("termux-wake-lock 2>/dev/null", shell=True)
+
+    # 1. Khởi động Bot (kèm Watchdog)
+    print("[1/2] Starting Bot Discord (Watchdog)...")
+    # LƯU Ý: KHÔNG redirect stdout/stderr vào data/bot.log — file đó do
+    # RotatingFileHandler trong bot/bot.py quản lý. Ghi chung một file sẽ làm
+    # việc xoay log lệch nhịp (tiến trình nohup vẫn giữ fd cũ sau khi file bị
+    # rename → log mới rơi vào bản rotated). stdout/stderr đi riêng vào
+    # data/bot.stdout.log và được watchdog cắt theo kích thước.
+    bot_log = os.path.join(PID_DIR, "bot.stdout.log")
+    os.makedirs(PID_DIR, exist_ok=True)
+    
+    if os.name == "nt":
+        p_bot = subprocess.Popen([sys.executable, "main.py", "--bot"], creationflags=subprocess.CREATE_NEW_CONSOLE)
+        _write_pid(PID_BOT, p_bot.pid)
+    else:
+        watchdog_script = os.path.join(BASE_DIR, "scripts", "watchdog.sh")
+        if os.path.exists(watchdog_script):
+            p_bot = subprocess.Popen(f"nohup bash {watchdog_script} > {bot_log} 2>&1 &", shell=True)
+            time.sleep(1)
+            try:
+                res_wd = subprocess.check_output("pgrep -f 'watchdog.sh'", shell=True, text=True).strip().splitlines()
+                if res_wd:
+                    _write_pid(PID_WATCHDOG, int(res_wd[0]))
+            except Exception:
+                pass
+        else:
+            p_bot = subprocess.Popen(f"nohup python main.py --bot > {bot_log} 2>&1 &", shell=True)
+        time.sleep(1)
+        res = subprocess.check_output("pgrep -f 'main.py --bot'", shell=True, text=True).strip().splitlines()
+        if res:
+            _write_pid(PID_BOT, int(res[0]))
+
+    # 2. Khởi động Dashboard
+    print("[2/2] Starting Dashboard...")
+    # Tương tự bot: dashboard/extensions.py tự ghi data/dashboard.log (RotatingFileHandler),
+    # còn stdout/stderr của tiến trình đi vào data/dashboard.stdout.log.
+    dash_log = os.path.join(PID_DIR, "dashboard.stdout.log")
+    if os.name == "nt":
+        p_dash = subprocess.Popen([sys.executable, "main.py", "--dashboard"], creationflags=subprocess.CREATE_NEW_CONSOLE)
+        _write_pid(PID_DASH, p_dash.pid)
+    else:
+        p_dash = subprocess.Popen(f"nohup python main.py --dashboard > {dash_log} 2>&1 &", shell=True)
+        time.sleep(1)
+        res = subprocess.check_output("pgrep -f 'main.py --dashboard'", shell=True, text=True).strip().splitlines()
+        if res:
+            _write_pid(PID_DASH, int(res[0]))
+
+    print("--------------------------------------------------")
+    print("[Main] System started successfully!")
+    print("- Web Dashboard: http://localhost:5000")
+    print("- Run 'python main.py --status' to check status.")
+    print("- Run 'python main.py --stop' to stop Bot & Dashboard (Watchdog will auto-restart after 30s).")
+    print("- Run 'python main.py --stopall' to stop all services completely.")
+    print("--------------------------------------------------")
+
+    # Send Webhook start notification
+    script_status = os.path.join(BASE_DIR, "scripts", "send_status.py")
+    if os.path.exists(script_status):
+        try:
+            subprocess.run([sys.executable, script_status, "start"], timeout=5)
+        except Exception:
+            pass
+
+
+def run_system_test():
+    print("[Tester] Running Self-Diagnostic Tester...")
+    try:
+        from tester import SystemTester
+    except ImportError:
+        print("[Tester] WARNING: tester.py not found, skipping self-test.")
+        return True
+    success = asyncio.run(SystemTester.run_all_tests())
+    return success
+
+
+def main():
+    args = [a.lower() for a in sys.argv[1:]]
+
+    if "--stopall" in args or "stopall" in args:
+        stop_services(keep_watchdog=False)
+        sys.exit(0)
+    elif "--stop" in args or "stop" in args:
+        stop_services(keep_watchdog=True)
+        sys.exit(0)
+    elif "--status" in args or "status" in args:
+        print_status()
+        sys.exit(0)
+    elif "--test" in args or "test" in args:
+        success = run_system_test()
+        sys.exit(0 if success else 1)
+    elif "--restart" in args or "restart" in args:
+        stop_all()
+        time.sleep(2)
+        print("\n[Main] Restarting system...")
+        try:
+            start_all()
+        except Exception as e:
+            print(f"[Main] Error restarting system: {e}")
+            sys.exit(1)
+        sys.exit(0)
+    elif "--bot" in args or "bot" in args:
+        run_only_bot()
+    elif "--sync" in args or "sync" in args:
+        # Chạy bot + đồng bộ slash commands (đăng ký lại lên Discord)
+        # "--sync" đã có sẵn trong sys.argv — bot.py setup_hook() tự nhận diện.
+        run_only_bot()
+    elif "--dashboard" in args or "dashboard" in args:
+        run_only_dashboard()
+    else:
+        # Default start all
+        start_all()
+
+
+if __name__ == "__main__":
+    main()
